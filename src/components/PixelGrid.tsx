@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { findClosestMardColor } from "../utils/findClosestMardColor";
 import { applyModeFilter } from "../utils/applyModeFilter";
+import { removeImageBackground } from "../utils/removeBackground";
+import { quantizeColors } from "../utils/colorQuantization";
 
 type PixelGridProps = {
   imageUrl: string | null;
@@ -30,6 +32,8 @@ type ColorStatistic = {
   hex: string;
   count: number;
 };
+
+type BackgroundRemovalMode = "ai" | "corner" | "none";
 
 function createEmptyPixel(): PixelCell {
   return {
@@ -64,6 +68,277 @@ function hexToRgb(hex: string) {
   };
 }
 
+/*
+ * 手动区域平均缩放，替代 canvas 内置的双三次插值缩放。
+ * 双三次插值在剧烈缩小、且原图有锐利边缘时容易产生
+ * “振铃”伪影（边缘附近出现原图没有的过冲颜色，
+ * 有时反而会让细节看起来“更清楚”，但那其实是伪影）。
+ * 区域平均永远不会过冲，是缩小图片时避免这类伪影的标准做法，
+ * 代价是小于一个目标像素的细节确实会被平均掉——
+ * 这一步造成的细节损失是物理上不可避免的，
+ * 只能通过增大 outputSize（提高图纸分辨率）来缓解。
+ */
+function downsampleByAreaAverage(
+  sourceData: Uint8ClampedArray,
+  sourceWidth: number,
+  sourceHeight: number,
+  outputSize: number
+): RawPixel[] {
+  const result: RawPixel[] = [];
+
+  for (let outY = 0; outY < outputSize; outY++) {
+    const startY = Math.floor(
+      (outY / outputSize) * sourceHeight
+    );
+
+    const endY = Math.max(
+      startY + 1,
+      Math.floor(
+        ((outY + 1) / outputSize) * sourceHeight
+      )
+    );
+
+    for (let outX = 0; outX < outputSize; outX++) {
+      const startX = Math.floor(
+        (outX / outputSize) * sourceWidth
+      );
+
+      const endX = Math.max(
+        startX + 1,
+        Math.floor(
+          ((outX + 1) / outputSize) * sourceWidth
+        )
+      );
+
+      let sumR = 0;
+      let sumG = 0;
+      let sumB = 0;
+      let sumA = 0;
+      let count = 0;
+
+      for (let y = startY; y < endY; y++) {
+        for (let x = startX; x < endX; x++) {
+          const index = (y * sourceWidth + x) * 4;
+
+          sumR += sourceData[index];
+          sumG += sourceData[index + 1];
+          sumB += sourceData[index + 2];
+          sumA += sourceData[index + 3];
+          count += 1;
+        }
+      }
+
+      result.push({
+        r: Math.round(sumR / count),
+        g: Math.round(sumG / count),
+        b: Math.round(sumB / count),
+        a: Math.round(sumA / count),
+      });
+    }
+  }
+
+  return result;
+}
+
+/*
+ * 双边滤波：只对“颜色相近”的邻居做平均，
+ * 颜色差异大的邻居权重会被压得很低。
+ *
+ * spatialSigma：考虑多远的邻居，越大波及范围越广。
+ * colorSigma：颜色容忍度，越大去噪越彻底但细节损失越多。
+ */
+function bilateralFilter(
+  pixels: RawPixel[],
+  width: number,
+  height: number,
+  spatialSigma: number,
+  colorSigma: number
+): RawPixel[] {
+  const radius = Math.max(
+    1,
+    Math.ceil(spatialSigma * 2)
+  );
+
+  const safeColorSigma = Math.max(
+    1,
+    colorSigma
+  );
+
+  const result: RawPixel[] = [];
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const centerIndex = y * width + x;
+      const center = pixels[centerIndex];
+
+      let sumR = 0;
+      let sumG = 0;
+      let sumB = 0;
+      let sumWeight = 0;
+
+      for (let dy = -radius; dy <= radius; dy++) {
+        for (let dx = -radius; dx <= radius; dx++) {
+          const ny = y + dy;
+          const nx = x + dx;
+
+          if (
+            ny < 0 ||
+            ny >= height ||
+            nx < 0 ||
+            nx >= width
+          ) {
+            continue;
+          }
+
+          const neighbor =
+            pixels[ny * width + nx];
+
+          const spatialDistanceSquared =
+            dx * dx + dy * dy;
+
+          const spatialWeight = Math.exp(
+            -spatialDistanceSquared /
+              (2 * spatialSigma * spatialSigma)
+          );
+
+          const colorDistanceSquared =
+            (neighbor.r - center.r) ** 2 +
+            (neighbor.g - center.g) ** 2 +
+            (neighbor.b - center.b) ** 2;
+
+          const colorWeight = Math.exp(
+            -colorDistanceSquared /
+              (2 * safeColorSigma * safeColorSigma)
+          );
+
+          const weight =
+            spatialWeight * colorWeight;
+
+          sumR += neighbor.r * weight;
+          sumG += neighbor.g * weight;
+          sumB += neighbor.b * weight;
+          sumWeight += weight;
+        }
+      }
+
+      result.push({
+        r: Math.round(sumR / sumWeight),
+        g: Math.round(sumG / sumWeight),
+        b: Math.round(sumB / sumWeight),
+        a: center.a,
+      });
+    }
+  }
+
+  return result;
+}
+
+/*
+ * 传统方式：用图片四角的平均颜色估计背景，
+ * 再从边缘开始 flood fill，只删除与边缘连接的背景。
+ */
+function computeCornerBackgroundMask(
+  rawPixels: RawPixel[],
+  outputSize: number
+): boolean[] {
+  const BACKGROUND_TOLERANCE = 35;
+
+  const cornerIndexes = [
+    0,
+    outputSize - 1,
+    (outputSize - 1) * outputSize,
+    outputSize * outputSize - 1,
+  ];
+
+  let backgroundR = 0;
+  let backgroundG = 0;
+  let backgroundB = 0;
+
+  for (const index of cornerIndexes) {
+    backgroundR += rawPixels[index].r;
+    backgroundG += rawPixels[index].g;
+    backgroundB += rawPixels[index].b;
+  }
+
+  backgroundR /= cornerIndexes.length;
+  backgroundG /= cornerIndexes.length;
+  backgroundB /= cornerIndexes.length;
+
+  function isBackgroundCandidate(pixel: RawPixel) {
+    if (pixel.a < 20) {
+      return true;
+    }
+
+    const redDifference = pixel.r - backgroundR;
+    const greenDifference = pixel.g - backgroundG;
+    const blueDifference = pixel.b - backgroundB;
+
+    const distance = Math.sqrt(
+      redDifference ** 2 +
+        greenDifference ** 2 +
+        blueDifference ** 2
+    );
+
+    return distance <= BACKGROUND_TOLERANCE;
+  }
+
+  const backgroundMask = Array(
+    outputSize * outputSize
+  ).fill(false);
+
+  const queue: number[] = [];
+  let queuePosition = 0;
+
+  function addToQueue(row: number, col: number) {
+    if (
+      row < 0 ||
+      row >= outputSize ||
+      col < 0 ||
+      col >= outputSize
+    ) {
+      return;
+    }
+
+    const index = row * outputSize + col;
+
+    if (backgroundMask[index]) {
+      return;
+    }
+
+    if (!isBackgroundCandidate(rawPixels[index])) {
+      return;
+    }
+
+    backgroundMask[index] = true;
+    queue.push(index);
+  }
+
+  for (let col = 0; col < outputSize; col++) {
+    addToQueue(0, col);
+    addToQueue(outputSize - 1, col);
+  }
+
+  for (let row = 0; row < outputSize; row++) {
+    addToQueue(row, 0);
+    addToQueue(row, outputSize - 1);
+  }
+
+  while (queuePosition < queue.length) {
+    const currentIndex = queue[queuePosition];
+    queuePosition += 1;
+
+    const row = Math.floor(currentIndex / outputSize);
+    const col = currentIndex % outputSize;
+
+    addToQueue(row - 1, col);
+    addToQueue(row + 1, col);
+    addToQueue(row, col - 1);
+    addToQueue(row, col + 1);
+  }
+
+  return backgroundMask;
+}
+
 function PixelGrid({
   imageUrl,
   boardSize,
@@ -71,6 +346,28 @@ function PixelGrid({
 }: PixelGridProps) {
   const [pixels, setPixels] = useState<PixelCell[]>([]);
   const [isExporting, setIsExporting] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [removalMode, setRemovalMode] =
+    useState<BackgroundRemovalMode>("ai");
+
+  /*
+   * 双边滤波开关和参数。
+   * 默认值比之前更保守，避免默认情况下就吃掉细节。
+   */
+  const [enableDenoise, setEnableDenoise] =
+    useState(true);
+  const [spatialSigma, setSpatialSigma] =
+    useState(1.0);
+  const [colorSigma, setColorSigma] = useState(12);
+
+  /*
+   * 颜色量化开关和参数。
+   */
+  const [
+    enableQuantization,
+    setEnableQuantization,
+  ] = useState(true);
+  const [maxColors, setMaxColors] = useState(40);
 
   useEffect(() => {
     if (!imageUrl) {
@@ -78,292 +375,323 @@ function PixelGrid({
       return;
     }
 
-    const image = new Image();
+    let isCancelled = false;
 
-    image.onload = () => {
-      const canvas = document.createElement("canvas");
-      const context = canvas.getContext("2d");
+    async function processImage() {
+      setIsProcessing(true);
 
-      if (!context) {
-        return;
-      }
+      let cleanUrl: string | null = null;
 
-      canvas.width = outputSize;
-      canvas.height = outputSize;
+      try {
+        /*
+         * 根据选择的模式，决定图片来源：
+         * - "ai"：先用 AI 模型抠图，拿到带透明通道的图片
+         * - "corner" / "none"：直接用原图
+         */
+        let sourceUrl = imageUrl as string;
 
-      context.clearRect(
-        0,
-        0,
-        outputSize,
-        outputSize
-      );
+        if (removalMode === "ai") {
+          const cleanBlob = await removeImageBackground(
+            imageUrl as string
+          );
 
-      context.imageSmoothingEnabled = true;
-      context.imageSmoothingQuality = "high";
+          cleanUrl = URL.createObjectURL(cleanBlob);
+          sourceUrl = cleanUrl;
+        }
 
-      context.drawImage(
-        image,
-        0,
-        0,
-        outputSize,
-        outputSize
-      );
+        const image = new Image();
 
-      const imageData = context.getImageData(
-        0,
-        0,
-        outputSize,
-        outputSize
-      );
-
-      const data = imageData.data;
-      const rawPixels: RawPixel[] = [];
-
-      for (
-        let index = 0;
-        index < data.length;
-        index += 4
-      ) {
-        rawPixels.push({
-          r: data[index],
-          g: data[index + 1],
-          b: data[index + 2],
-          a: data[index + 3],
+        await new Promise<void>((resolve, reject) => {
+          image.onload = () => resolve();
+          image.onerror = () =>
+            reject(new Error("图片读取失败"));
+          image.src = sourceUrl;
         });
-      }
 
-      /*
-       * 使用图片四角的平均颜色估计背景。
-       */
-      const cornerIndexes = [
-        0,
-        outputSize - 1,
-        (outputSize - 1) * outputSize,
-        outputSize * outputSize - 1,
-      ];
-
-      let backgroundR = 0;
-      let backgroundG = 0;
-      let backgroundB = 0;
-
-      for (const index of cornerIndexes) {
-        backgroundR += rawPixels[index].r;
-        backgroundG += rawPixels[index].g;
-        backgroundB += rawPixels[index].b;
-      }
-
-      backgroundR /= cornerIndexes.length;
-      backgroundG /= cornerIndexes.length;
-      backgroundB /= cornerIndexes.length;
-
-      const BACKGROUND_TOLERANCE = 55;
-
-      function isBackgroundCandidate(
-        pixel: RawPixel
-      ) {
-        if (pixel.a < 20) {
-          return true;
+        if (isCancelled) {
+          return;
         }
 
-        const redDifference =
-          pixel.r - backgroundR;
-
-        const greenDifference =
-          pixel.g - backgroundG;
-
-        const blueDifference =
-          pixel.b - backgroundB;
-
-        const distance = Math.sqrt(
-          redDifference ** 2 +
-            greenDifference ** 2 +
-            blueDifference ** 2
+        /*
+         * 第一步：把原图缩放到一个适中的“工作分辨率”，
+         * 用浏览器内置的高质量缩放即可——
+         * 这一步还没到最终的极小尺寸，振铃伪影不明显。
+         */
+        const workingSize = Math.min(
+          Math.max(outputSize * 4, 200),
+          1200
         );
 
-        return distance <= BACKGROUND_TOLERANCE;
-      }
+        const workingCanvas =
+          document.createElement("canvas");
 
-      /*
-       * 从图片边缘开始进行 flood fill，
-       * 只删除与边缘连接的背景。
-       */
-      const backgroundMask = Array(
-        outputSize * outputSize
-      ).fill(false);
+        const workingContext =
+          workingCanvas.getContext("2d");
 
-      const queue: number[] = [];
-      let queuePosition = 0;
-
-      function addToQueue(
-        row: number,
-        col: number
-      ) {
-        if (
-          row < 0 ||
-          row >= outputSize ||
-          col < 0 ||
-          col >= outputSize
-        ) {
+        if (!workingContext) {
           return;
         }
 
-        const index =
-          row * outputSize + col;
+        workingCanvas.width = workingSize;
+        workingCanvas.height = workingSize;
 
-        if (backgroundMask[index]) {
-          return;
-        }
+        workingContext.imageSmoothingEnabled = true;
+        workingContext.imageSmoothingQuality =
+          "high";
 
-        if (
-          !isBackgroundCandidate(
-            rawPixels[index]
-          )
-        ) {
-          return;
-        }
-
-        backgroundMask[index] = true;
-        queue.push(index);
-      }
-
-      for (
-        let col = 0;
-        col < outputSize;
-        col++
-      ) {
-        addToQueue(0, col);
-        addToQueue(outputSize - 1, col);
-      }
-
-      for (
-        let row = 0;
-        row < outputSize;
-        row++
-      ) {
-        addToQueue(row, 0);
-        addToQueue(row, outputSize - 1);
-      }
-
-      while (
-        queuePosition < queue.length
-      ) {
-        const currentIndex =
-          queue[queuePosition];
-
-        queuePosition += 1;
-
-        const row = Math.floor(
-          currentIndex / outputSize
+        workingContext.clearRect(
+          0,
+          0,
+          workingSize,
+          workingSize
         );
 
-        const col =
-          currentIndex % outputSize;
+        workingContext.drawImage(
+          image,
+          0,
+          0,
+          workingSize,
+          workingSize
+        );
 
-        addToQueue(row - 1, col);
-        addToQueue(row + 1, col);
-        addToQueue(row, col - 1);
-        addToQueue(row, col + 1);
-      }
+        const workingImageData =
+          workingContext.getImageData(
+            0,
+            0,
+            workingSize,
+            workingSize
+          );
 
-      /*
-       * 将有效像素匹配为最接近的 MARD 颜色。
-       */
-      const patternPixels: PixelCell[] =
-        rawPixels.map((pixel, index) => {
-          if (
-            backgroundMask[index] ||
-            pixel.a < 20
-          ) {
-            return createEmptyPixel();
+        /*
+         * 第二步：手动区域平均缩放到最终的小尺寸，
+         * 避免双三次插值在剧烈缩小时产生振铃伪影。
+         */
+        const areaAveragedPixels =
+          downsampleByAreaAverage(
+            workingImageData.data,
+            workingSize,
+            workingSize,
+            outputSize
+          );
+
+        if (isCancelled) {
+          return;
+        }
+
+        /*
+         * 第三步（可选）：双边滤波去噪，同时尽量保留真实边缘细节。
+         * 关闭时直接使用区域平均后的像素，不做任何额外平滑。
+         */
+        const rawPixels = enableDenoise
+          ? bilateralFilter(
+              areaAveragedPixels,
+              outputSize,
+              outputSize,
+              spatialSigma,
+              colorSigma
+            )
+          : areaAveragedPixels;
+
+        /*
+         * AI 模式：背景已经被抠除，透明区域 alpha 很低，不需要额外遮罩。
+         * corner 模式：用角落取色 + flood fill 计算背景遮罩。
+         * none 模式：完全不处理，只有原图本身透明的部分才会被当作空白。
+         */
+        const backgroundMask =
+          removalMode === "corner"
+            ? computeCornerBackgroundMask(
+                rawPixels,
+                outputSize
+              )
+            : null;
+
+        /*
+         * 第四步（可选）：在 Lab 色彩空间里做颜色量化，
+         * 把大量相近颜色合并成有限个代表色，再统一匹配 MARD 色号。
+         * 关闭时，每个像素独立去匹配最近的 MARD 色号，
+         * 能保留更多细节，但也会保留更多噪声色。
+         */
+        let quantizedColorByPixelIndex: Map<
+          number,
+          { r: number; g: number; b: number }
+        > | null = null;
+
+        if (enableQuantization) {
+          const foregroundIndexes: number[] = [];
+          const foregroundColors: {
+            r: number;
+            g: number;
+            b: number;
+          }[] = [];
+
+          rawPixels.forEach((pixel, index) => {
+            const isBackground =
+              pixel.a < 20 ||
+              (backgroundMask
+                ? backgroundMask[index]
+                : false);
+
+            if (!isBackground) {
+              foregroundIndexes.push(index);
+              foregroundColors.push({
+                r: pixel.r,
+                g: pixel.g,
+                b: pixel.b,
+              });
+            }
+          });
+
+          const { assignments, centroids } =
+            quantizeColors(
+              foregroundColors,
+              maxColors
+            );
+
+          quantizedColorByPixelIndex = new Map();
+
+          foregroundIndexes.forEach(
+            (pixelIndex, i) => {
+              quantizedColorByPixelIndex!.set(
+                pixelIndex,
+                centroids[assignments[i]]
+              );
+            }
+          );
+        }
+
+        const patternPixels: PixelCell[] = rawPixels.map(
+          (pixel, index) => {
+            const isBackground =
+              pixel.a < 20 ||
+              (backgroundMask
+                ? backgroundMask[index]
+                : false);
+
+            if (isBackground) {
+              return createEmptyPixel();
+            }
+
+            const colorToMatch =
+              quantizedColorByPixelIndex?.get(
+                index
+              ) ?? {
+                r: pixel.r,
+                g: pixel.g,
+                b: pixel.b,
+              };
+
+            const closestMardColor =
+              findClosestMardColor(
+                colorToMatch
+              );
+
+            return {
+              r: closestMardColor.rgb.r,
+              g: closestMardColor.rgb.g,
+              b: closestMardColor.rgb.b,
+              a: 255,
+              isEmpty: false,
+              colorCode:
+                closestMardColor.code,
+              hex: closestMardColor.hex,
+            };
           }
-
-          const closestMardColor =
-            findClosestMardColor({
-              r: pixel.r,
-              g: pixel.g,
-              b: pixel.b,
-            });
-
-          return {
-            r: closestMardColor.rgb.r,
-            g: closestMardColor.rgb.g,
-            b: closestMardColor.rgb.b,
-            a: 255,
-            isEmpty: false,
-            colorCode:
-              closestMardColor.code,
-            hex: closestMardColor.hex,
-          };
-        });
-
-      /*
-       * 3×3 众数滤波，减少零碎颜色。
-       */
-      const filteredPatternPixels =
-        applyModeFilter(patternPixels, {
-          width: outputSize,
-          height: outputSize,
-          minimumMajorityCount: 5,
-        });
-
-      /*
-       * 创建完整豆板。
-       */
-      const boardPixels: PixelCell[] =
-        Array.from(
-          {
-            length:
-              boardSize * boardSize,
-          },
-          createEmptyPixel
         );
 
-      /*
-       * 把图案放到豆板中央。
-       */
-      const startRow = Math.floor(
-        (boardSize - outputSize) / 2
-      );
+        /*
+         * 3×3 众数滤波，清理剩余的孤立噪点像素。
+         */
+        const filteredPatternPixels =
+          applyModeFilter(patternPixels, {
+            width: outputSize,
+            height: outputSize,
+            minimumMajorityCount: 5,
+          });
 
-      const startCol = Math.floor(
-        (boardSize - outputSize) / 2
-      );
+        /*
+         * 创建完整豆板。
+         */
+        const boardPixels: PixelCell[] =
+          Array.from(
+            {
+              length:
+                boardSize * boardSize,
+            },
+            createEmptyPixel
+          );
 
-      for (
-        let row = 0;
-        row < outputSize;
-        row++
-      ) {
+        /*
+         * 把图案放到豆板中央。
+         */
+        const startRow = Math.floor(
+          (boardSize - outputSize) / 2
+        );
+
+        const startCol = Math.floor(
+          (boardSize - outputSize) / 2
+        );
+
         for (
-          let col = 0;
-          col < outputSize;
-          col++
+          let row = 0;
+          row < outputSize;
+          row++
         ) {
-          const patternIndex =
-            row * outputSize + col;
+          for (
+            let col = 0;
+            col < outputSize;
+            col++
+          ) {
+            const patternIndex =
+              row * outputSize + col;
 
-          const boardIndex =
-            (startRow + row) *
-              boardSize +
-            (startCol + col);
+            const boardIndex =
+              (startRow + row) *
+                boardSize +
+              (startCol + col);
 
-          boardPixels[boardIndex] =
-            filteredPatternPixels[
-              patternIndex
-            ];
+            boardPixels[boardIndex] =
+              filteredPatternPixels[
+                patternIndex
+              ];
+          }
+        }
+
+        if (!isCancelled) {
+          setPixels(boardPixels);
+        }
+      } catch (error) {
+        console.error("图片处理失败", error);
+
+        if (!isCancelled) {
+          setPixels([]);
+        }
+      } finally {
+        if (cleanUrl) {
+          URL.revokeObjectURL(cleanUrl);
+        }
+
+        if (!isCancelled) {
+          setIsProcessing(false);
         }
       }
+    }
 
-      setPixels(boardPixels);
+    processImage();
+
+    return () => {
+      isCancelled = true;
     };
-
-    image.onerror = () => {
-      console.error("图片读取失败");
-      setPixels([]);
-    };
-
-    image.src = imageUrl;
-  }, [imageUrl, boardSize, outputSize]);
+  }, [
+    imageUrl,
+    boardSize,
+    outputSize,
+    removalMode,
+    enableDenoise,
+    spatialSigma,
+    colorSigma,
+    enableQuantization,
+    maxColors,
+  ]);
 
   /*
    * 统计每个 MARD 色号的数量。
@@ -458,8 +786,7 @@ function PixelGrid({
       );
 
       const legendWidth =
-        legendColumns *
-        legendItemWidth;
+        legendColumns * legendItemWidth;
 
       const contentWidth = Math.max(
         boardPixelSize,
@@ -924,293 +1251,551 @@ function PixelGrid({
     <section>
       <h2>拼豆图纸预览</h2>
 
-      <button
-        type="button"
-        onClick={exportPatternAsPng}
-        disabled={
-          pixels.length === 0 ||
-          isExporting
-        }
+      <div
         style={{
-          marginBottom: "20px",
-          padding: "12px 20px",
-          border: "1px solid #222222",
-          borderRadius: "8px",
-          backgroundColor: "#222222",
-          color: "#FFFFFF",
-          fontSize: "16px",
-          cursor:
-            pixels.length === 0
-              ? "not-allowed"
-              : "pointer",
-          opacity:
-            pixels.length === 0
-              ? 0.5
-              : 1,
+          marginBottom: "16px",
+          display: "flex",
+          alignItems: "center",
+          gap: "20px",
+          flexWrap: "wrap",
         }}
       >
-        {isExporting
-          ? "正在导出..."
-          : "导出高清 PNG 图纸"}
-      </button>
+        <span style={{ fontWeight: 600 }}>
+          去背景方式：
+        </span>
+
+        <label
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
+            cursor: "pointer",
+          }}
+        >
+          <input
+            type="radio"
+            name="removal-mode"
+            value="ai"
+            checked={removalMode === "ai"}
+            onChange={() =>
+              setRemovalMode("ai")
+            }
+          />
+          AI 智能识别主体（推荐）
+        </label>
+
+        <label
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
+            cursor: "pointer",
+          }}
+        >
+          <input
+            type="radio"
+            name="removal-mode"
+            value="corner"
+            checked={
+              removalMode === "corner"
+            }
+            onChange={() =>
+              setRemovalMode("corner")
+            }
+          />
+          传统方式（角落取色，速度快）
+        </label>
+
+        <label
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
+            cursor: "pointer",
+          }}
+        >
+          <input
+            type="radio"
+            name="removal-mode"
+            value="none"
+            checked={
+              removalMode === "none"
+            }
+            onChange={() =>
+              setRemovalMode("none")
+            }
+          />
+          不消除背景（保留原图）
+        </label>
+      </div>
 
       <div
         style={{
-          overflow: "auto",
-          maxWidth: "100%",
-          padding: "10px 0",
+          marginBottom: "16px",
+          padding: "12px 16px",
+          border: "1px solid #d1d5db",
+          borderRadius: "8px",
         }}
       >
-        <div
+        <label
           style={{
-            display: "grid",
-            gridTemplateColumns: `repeat(${boardSize}, ${cellSize}px)`,
-            gridTemplateRows: `repeat(${boardSize}, ${cellSize}px)`,
-            width: "fit-content",
-            margin: "0 auto",
-            backgroundColor: "#FFFFFF",
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            cursor: "pointer",
+            fontWeight: 600,
+            marginBottom: "8px",
           }}
         >
-          {pixels.map(
-            (pixel, index) => {
-              const row = Math.floor(
-                index / boardSize
-              );
-
-              const col =
-                index % boardSize;
-
-              const isTopEdge =
-                row === 0;
-
-              const isBottomEdge =
-                row ===
-                boardSize - 1;
-
-              const isLeftEdge =
-                col === 0;
-
-              const isRightEdge =
-                col ===
-                boardSize - 1;
-
-              const isTenRowLine =
-                row > 0 &&
-                row % 10 === 0;
-
-              const isTenColLine =
-                col > 0 &&
-                col % 10 === 0;
-
-              const isFiveRowLine =
-                row > 0 &&
-                row % 5 === 0 &&
-                row % 10 !== 0;
-
-              const isFiveColLine =
-                col > 0 &&
-                col % 5 === 0 &&
-                col % 10 !== 0;
-
-              const borderTopWidth =
-                isTopEdge
-                  ? 3
-                  : isTenRowLine
-                    ? 3
-                    : isFiveRowLine
-                      ? 2
-                      : 1;
-
-              const borderLeftWidth =
-                isLeftEdge
-                  ? 3
-                  : isTenColLine
-                    ? 3
-                    : isFiveColLine
-                      ? 2
-                      : 1;
-
-              const borderBottomWidth =
-                isBottomEdge
-                  ? 3
-                  : 0;
-
-              const borderRightWidth =
-                isRightEdge
-                  ? 3
-                  : 0;
-
-              const textColor =
-                getTextColor(
-                  pixel.r,
-                  pixel.g,
-                  pixel.b
-                );
-
-              return (
-                <div
-                  key={index}
-                  title={
-                    pixel.isEmpty
-                      ? "空白"
-                      : `${pixel.colorCode} ${pixel.hex}`
-                  }
-                  style={{
-                    width: `${cellSize}px`,
-                    height: `${cellSize}px`,
-                    boxSizing:
-                      "border-box",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent:
-                      "center",
-
-                    borderTop: `${borderTopWidth}px solid #9ca3af`,
-                    borderLeft: `${borderLeftWidth}px solid #9ca3af`,
-                    borderBottom: `${borderBottomWidth}px solid #6b7280`,
-                    borderRight: `${borderRightWidth}px solid #6b7280`,
-
-                    backgroundColor:
-                      pixel.isEmpty
-                        ? "#FFFFFF"
-                        : pixel.hex,
-
-                    color:
-                      pixel.isEmpty
-                        ? "transparent"
-                        : textColor,
-
-                    fontSize: "8px",
-                    fontWeight: 600,
-                    lineHeight: 1,
-                    overflow: "hidden",
-                    userSelect: "none",
-                  }}
-                >
-                  {pixel.colorCode}
-                </div>
-              );
+          <input
+            type="checkbox"
+            checked={enableDenoise}
+            onChange={(event) =>
+              setEnableDenoise(
+                event.target.checked
+              )
             }
-          )}
-        </div>
+          />
+          启用双边滤波去噪
+        </label>
+
+        {enableDenoise && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "20px",
+              flexWrap: "wrap",
+              paddingLeft: "24px",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+              }}
+            >
+              <label htmlFor="spatial-sigma">
+                空间范围（{spatialSigma.toFixed(1)}）
+              </label>
+              <input
+                id="spatial-sigma"
+                type="range"
+                min={0.5}
+                max={3}
+                step={0.1}
+                value={spatialSigma}
+                onChange={(event) =>
+                  setSpatialSigma(
+                    Number(event.target.value)
+                  )
+                }
+                style={{ width: "160px" }}
+              />
+            </div>
+
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+              }}
+            >
+              <label htmlFor="color-sigma">
+                去噪强度（{colorSigma}）
+              </label>
+              <input
+                id="color-sigma"
+                type="range"
+                min={1}
+                max={60}
+                step={1}
+                value={colorSigma}
+                onChange={(event) =>
+                  setColorSigma(
+                    Number(event.target.value)
+                  )
+                }
+                style={{ width: "160px" }}
+              />
+            </div>
+          </div>
+        )}
       </div>
 
-      {pixels.length > 0 && (
-        <div
+      <div
+        style={{
+          marginBottom: "20px",
+          padding: "12px 16px",
+          border: "1px solid #d1d5db",
+          borderRadius: "8px",
+        }}
+      >
+        <label
           style={{
-            maxWidth: "900px",
-            margin: "32px auto 0",
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            cursor: "pointer",
+            fontWeight: 600,
+            marginBottom: "8px",
           }}
         >
-          <h2>颜色用量</h2>
+          <input
+            type="checkbox"
+            checked={enableQuantization}
+            onChange={(event) =>
+              setEnableQuantization(
+                event.target.checked
+              )
+            }
+          />
+          启用颜色量化（合并相近色）
+        </label>
 
-          <p>
-            总拼豆数量：
-            <strong>
-              {totalBeads}
-            </strong>{" "}
-            颗
-          </p>
+        {enableQuantization && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              paddingLeft: "24px",
+            }}
+          >
+            <label htmlFor="max-colors">
+              最多颜色数（{maxColors}）
+            </label>
+            <input
+              id="max-colors"
+              type="range"
+              min={8}
+              max={64}
+              step={1}
+              value={maxColors}
+              onChange={(event) =>
+                setMaxColors(
+                  Number(event.target.value)
+                )
+              }
+              style={{ width: "220px" }}
+            />
+          </div>
+        )}
+      </div>
 
-          <p>
-            使用颜色数量：
-            <strong>
-              {colorStatistics.length}
-            </strong>{" "}
-            种
-          </p>
+      {isProcessing ? (
+        <p>正在处理图片，请稍候...</p>
+      ) : (
+        <>
+          <button
+            type="button"
+            onClick={exportPatternAsPng}
+            disabled={
+              pixels.length === 0 ||
+              isExporting
+            }
+            style={{
+              marginBottom: "20px",
+              padding: "12px 20px",
+              border: "1px solid #222222",
+              borderRadius: "8px",
+              backgroundColor:
+                "#222222",
+              color: "#FFFFFF",
+              fontSize: "16px",
+              cursor:
+                pixels.length === 0
+                  ? "not-allowed"
+                  : "pointer",
+              opacity:
+                pixels.length === 0
+                  ? 0.5
+                  : 1,
+            }}
+          >
+            {isExporting
+              ? "正在导出..."
+              : "导出高清 PNG 图纸"}
+          </button>
 
           <div
             style={{
-              display: "grid",
-              gridTemplateColumns:
-                "repeat(auto-fit, minmax(150px, 1fr))",
-              gap: "12px",
-              marginTop: "16px",
+              overflow: "auto",
+              maxWidth: "100%",
+              padding: "10px 0",
             }}
           >
-            {colorStatistics.map(
-              (color) => {
-                const rgb =
-                  hexToRgb(
-                    color.hex
-                  );
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: `repeat(${boardSize}, ${cellSize}px)`,
+                gridTemplateRows: `repeat(${boardSize}, ${cellSize}px)`,
+                width: "fit-content",
+                margin: "0 auto",
+                backgroundColor:
+                  "#FFFFFF",
+              }}
+            >
+              {pixels.map(
+                (pixel, index) => {
+                  const row =
+                    Math.floor(
+                      index / boardSize
+                    );
 
-                const textColor =
-                  getTextColor(
-                    rgb.r,
-                    rgb.g,
-                    rgb.b
-                  );
+                  const col =
+                    index % boardSize;
 
-                return (
-                  <div
-                    key={color.code}
-                    style={{
-                      display: "flex",
-                      alignItems:
-                        "center",
-                      gap: "12px",
-                      padding: "10px",
-                      border:
-                        "1px solid #d1d5db",
-                      borderRadius:
-                        "8px",
-                      backgroundColor:
-                        "#FFFFFF",
-                    }}
-                  >
+                  const isTopEdge =
+                    row === 0;
+
+                  const isBottomEdge =
+                    row ===
+                    boardSize - 1;
+
+                  const isLeftEdge =
+                    col === 0;
+
+                  const isRightEdge =
+                    col ===
+                    boardSize - 1;
+
+                  const isTenRowLine =
+                    row > 0 &&
+                    row % 10 === 0;
+
+                  const isTenColLine =
+                    col > 0 &&
+                    col % 10 === 0;
+
+                  const isFiveRowLine =
+                    row > 0 &&
+                    row % 5 === 0 &&
+                    row % 10 !== 0;
+
+                  const isFiveColLine =
+                    col > 0 &&
+                    col % 5 === 0 &&
+                    col % 10 !== 0;
+
+                  const borderTopWidth =
+                    isTopEdge
+                      ? 3
+                      : isTenRowLine
+                        ? 3
+                        : isFiveRowLine
+                          ? 2
+                          : 1;
+
+                  const borderLeftWidth =
+                    isLeftEdge
+                      ? 3
+                      : isTenColLine
+                        ? 3
+                        : isFiveColLine
+                          ? 2
+                          : 1;
+
+                  const borderBottomWidth =
+                    isBottomEdge
+                      ? 3
+                      : 0;
+
+                  const borderRightWidth =
+                    isRightEdge
+                      ? 3
+                      : 0;
+
+                  const textColor =
+                    getTextColor(
+                      pixel.r,
+                      pixel.g,
+                      pixel.b
+                    );
+
+                  return (
                     <div
+                      key={index}
+                      title={
+                        pixel.isEmpty
+                          ? "空白"
+                          : `${pixel.colorCode} ${pixel.hex}`
+                      }
                       style={{
-                        width: "42px",
-                        height: "42px",
-                        flexShrink: 0,
+                        width: `${cellSize}px`,
+                        height: `${cellSize}px`,
+                        boxSizing:
+                          "border-box",
                         display: "flex",
                         alignItems:
                           "center",
                         justifyContent:
                           "center",
-                        border:
-                          "1px solid #9ca3af",
-                        borderRadius:
-                          "6px",
+
+                        borderTop: `${borderTopWidth}px solid #9ca3af`,
+                        borderLeft: `${borderLeftWidth}px solid #9ca3af`,
+                        borderBottom: `${borderBottomWidth}px solid #6b7280`,
+                        borderRight: `${borderRightWidth}px solid #6b7280`,
+
                         backgroundColor:
-                          color.hex,
+                          pixel.isEmpty
+                            ? "#FFFFFF"
+                            : pixel.hex,
+
                         color:
-                          textColor,
-                        fontSize:
-                          "11px",
-                        fontWeight: 700,
+                          pixel.isEmpty
+                            ? "transparent"
+                            : textColor,
+
+                        fontSize: "8px",
+                        fontWeight: 600,
+                        lineHeight: 1,
+                        overflow:
+                          "hidden",
+                        userSelect:
+                          "none",
                       }}
                     >
-                      {color.code}
+                      {pixel.colorCode}
                     </div>
-
-                    <div>
-                      <div
-                        style={{
-                          fontWeight:
-                            700,
-                        }}
-                      >
-                        {color.code}
-                      </div>
-
-                      <div
-                        style={{
-                          fontSize:
-                            "14px",
-                        }}
-                      >
-                        {color.count} 颗
-                      </div>
-                    </div>
-                  </div>
-                );
-              }
-            )}
+                  );
+                }
+              )}
+            </div>
           </div>
-        </div>
+
+          {pixels.length > 0 && (
+            <div
+              style={{
+                maxWidth: "900px",
+                margin: "32px auto 0",
+              }}
+            >
+              <h2>颜色用量</h2>
+
+              <p>
+                总拼豆数量：
+                <strong>
+                  {totalBeads}
+                </strong>{" "}
+                颗
+              </p>
+
+              <p>
+                使用颜色数量：
+                <strong>
+                  {
+                    colorStatistics.length
+                  }
+                </strong>{" "}
+                种
+              </p>
+
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns:
+                    "repeat(auto-fit, minmax(150px, 1fr))",
+                  gap: "12px",
+                  marginTop: "16px",
+                }}
+              >
+                {colorStatistics.map(
+                  (color) => {
+                    const rgb =
+                      hexToRgb(
+                        color.hex
+                      );
+
+                    const textColor =
+                      getTextColor(
+                        rgb.r,
+                        rgb.g,
+                        rgb.b
+                      );
+
+                    return (
+                      <div
+                        key={
+                          color.code
+                        }
+                        style={{
+                          display:
+                            "flex",
+                          alignItems:
+                            "center",
+                          gap: "12px",
+                          padding:
+                            "10px",
+                          border:
+                            "1px solid #d1d5db",
+                          borderRadius:
+                            "8px",
+                          backgroundColor:
+                            "#FFFFFF",
+                        }}
+                      >
+                        <div
+                          style={{
+                            width:
+                              "42px",
+                            height:
+                              "42px",
+                            flexShrink: 0,
+                            display:
+                              "flex",
+                            alignItems:
+                              "center",
+                            justifyContent:
+                              "center",
+                            border:
+                              "1px solid #9ca3af",
+                            borderRadius:
+                              "6px",
+                            backgroundColor:
+                              color.hex,
+                            color:
+                              textColor,
+                            fontSize:
+                              "11px",
+                            fontWeight: 700,
+                          }}
+                        >
+                          {color.code}
+                        </div>
+
+                        <div>
+                          <div
+                            style={{
+                              fontWeight: 700,
+                            }}
+                          >
+                            {
+                              color.code
+                            }
+                          </div>
+
+                          <div
+                            style={{
+                              fontSize:
+                                "14px",
+                            }}
+                          >
+                            {
+                              color.count
+                            }{" "}
+                            颗
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  }
+                )}
+              </div>
+            </div>
+          )}
+        </>
       )}
     </section>
   );
