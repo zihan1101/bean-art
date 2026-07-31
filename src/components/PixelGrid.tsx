@@ -3,6 +3,10 @@ import { findClosestMardColor } from "../utils/findClosestMardColor";
 import { applyModeFilter } from "../utils/applyModeFilter";
 import { removeImageBackground } from "../utils/removeBackground";
 import { quantizeColors } from "../utils/colorQuantization";
+import {
+  mardColors,
+  type MardColor,
+} from "../data/mardColors";
 
 type PixelGridProps = {
   imageUrl: string | null;
@@ -34,6 +38,31 @@ type ColorStatistic = {
 };
 
 type BackgroundRemovalMode = "ai" | "corner" | "none";
+
+type ColorPickerTarget =
+  | { type: "single"; pixelIndex: number }
+  | { type: "batch"; colorCode: string };
+
+/*
+ * 按色号前缀（A / B / ... / H / M）把 MARD 色卡分组，
+ * 方便在选色器里分区浏览，而不是把 221 个色块堆成一坨。
+ */
+const mardColorGroups: [string, MardColor[]][] = (() => {
+  const groups = new Map<string, MardColor[]>();
+
+  for (const color of mardColors) {
+    const prefixMatch = color.code.match(/^[A-Za-z]+/);
+    const prefix = prefixMatch ? prefixMatch[0] : "其他";
+
+    if (!groups.has(prefix)) {
+      groups.set(prefix, []);
+    }
+
+    groups.get(prefix)!.push(color);
+  }
+
+  return Array.from(groups.entries());
+})();
 
 function createEmptyPixel(): PixelCell {
   return {
@@ -348,6 +377,64 @@ function PixelGrid({
     setEnableQuantization,
   ] = useState(true);
   const [maxColors, setMaxColors] = useState(40);
+
+  /*
+   * 手动改色：
+   * - "single" 表示正在改豆板上某一颗豆子
+   * - "batch" 表示正在把某个色号整体替换成别的颜色
+   */
+  const [colorPickerTarget, setColorPickerTarget] =
+    useState<ColorPickerTarget | null>(null);
+
+  function applyColorChange(newColor: MardColor | null) {
+    if (!colorPickerTarget) {
+      return;
+    }
+
+    setPixels((previousPixels) => {
+      if (colorPickerTarget.type === "single") {
+        const updatedPixels = [...previousPixels];
+        const targetIndex = colorPickerTarget.pixelIndex;
+
+        updatedPixels[targetIndex] = newColor
+          ? {
+              r: newColor.rgb.r,
+              g: newColor.rgb.g,
+              b: newColor.rgb.b,
+              a: 255,
+              isEmpty: false,
+              colorCode: newColor.code,
+              hex: newColor.hex,
+            }
+          : createEmptyPixel();
+
+        return updatedPixels;
+      }
+
+      const targetColorCode =
+        colorPickerTarget.colorCode;
+
+      return previousPixels.map((pixel) => {
+        if (pixel.colorCode !== targetColorCode) {
+          return pixel;
+        }
+
+        return newColor
+          ? {
+              r: newColor.rgb.r,
+              g: newColor.rgb.g,
+              b: newColor.rgb.b,
+              a: 255,
+              isEmpty: false,
+              colorCode: newColor.code,
+              hex: newColor.hex,
+            }
+          : createEmptyPixel();
+      });
+    });
+
+    setColorPickerTarget(null);
+  }
 
   useEffect(() => {
     if (!imageUrl) {
@@ -1545,8 +1632,14 @@ function PixelGrid({
                       key={index}
                       title={
                         pixel.isEmpty
-                          ? "空白"
-                          : `${pixel.colorCode} ${pixel.hex}`
+                          ? "空白（点击可放置颜色）"
+                          : `${pixel.colorCode} ${pixel.hex}（点击可改色）`
+                      }
+                      onClick={() =>
+                        setColorPickerTarget({
+                          type: "single",
+                          pixelIndex: index,
+                        })
                       }
                       style={{
                         width: `${cellSize}px`,
@@ -1557,6 +1650,7 @@ function PixelGrid({
                         alignItems: "center",
                         justifyContent:
                           "center",
+                        cursor: "pointer",
 
                         borderTop: `${borderTopWidth}px solid #9ca3af`,
                         borderLeft: `${borderLeftWidth}px solid #9ca3af`,
@@ -1642,6 +1736,13 @@ function PixelGrid({
                     return (
                       <div
                         key={color.code}
+                        title={`点击把 ${color.code} 整体改成别的颜色`}
+                        onClick={() =>
+                          setColorPickerTarget({
+                            type: "batch",
+                            colorCode: color.code,
+                          })
+                        }
                         style={{
                           display: "flex",
                           alignItems:
@@ -1653,6 +1754,7 @@ function PixelGrid({
                           borderRadius: "999px",
                           background:
                             "var(--paper)",
+                          cursor: "pointer",
                         }}
                       >
                         <div
@@ -1708,6 +1810,174 @@ function PixelGrid({
             </div>
           )}
         </>
+      )}
+
+      {colorPickerTarget && (
+        <div
+          onClick={() => setColorPickerTarget(null)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(58, 44, 48, 0.45)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: "20px",
+            zIndex: 1000,
+          }}
+        >
+          <div
+            onClick={(event) =>
+              event.stopPropagation()
+            }
+            style={{
+              background: "var(--paper)",
+              borderRadius: "16px",
+              padding: "20px",
+              width: "100%",
+              maxWidth: "480px",
+              maxHeight: "80vh",
+              overflowY: "auto",
+              boxShadow:
+                "0 12px 30px rgba(58, 44, 48, 0.3)",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                marginBottom: "14px",
+              }}
+            >
+              <h3
+                style={{
+                  fontSize: "16px",
+                  margin: 0,
+                }}
+              >
+                {colorPickerTarget.type === "batch"
+                  ? `把 ${colorPickerTarget.colorCode} 整体改成…`
+                  : "选择这颗豆子的颜色"}
+              </h3>
+
+              <button
+                type="button"
+                onClick={() =>
+                  setColorPickerTarget(null)
+                }
+                style={{
+                  border: "none",
+                  background: "none",
+                  fontSize: "20px",
+                  lineHeight: 1,
+                  color: "var(--ink-soft)",
+                  cursor: "pointer",
+                  padding: "4px 8px",
+                }}
+              >
+                ×
+              </button>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => applyColorChange(null)}
+              style={{
+                marginBottom: "16px",
+                padding: "8px 16px",
+                borderRadius: "999px",
+                border: "1px solid var(--border-soft)",
+                background: "#FFFFFF",
+                fontSize: "13px",
+                fontWeight: 600,
+                color: "var(--ink-soft)",
+                cursor: "pointer",
+              }}
+            >
+              设为空白（不放豆子）
+            </button>
+
+            {mardColorGroups.map(
+              ([groupName, colorsInGroup]) => (
+                <div
+                  key={groupName}
+                  style={{ marginBottom: "16px" }}
+                >
+                  <div
+                    style={{
+                      fontSize: "12px",
+                      fontWeight: 700,
+                      color: "var(--ink-soft)",
+                      marginBottom: "6px",
+                    }}
+                  >
+                    {groupName} 系列
+                  </div>
+
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns:
+                        "repeat(auto-fill, 40px)",
+                      gap: "6px",
+                    }}
+                  >
+                    {colorsInGroup.map((color) => {
+                      const rgb = hexToRgb(
+                        color.hex
+                      );
+
+                      const textColor =
+                        getTextColor(
+                          rgb.r,
+                          rgb.g,
+                          rgb.b
+                        );
+
+                      return (
+                        <button
+                          key={color.code}
+                          type="button"
+                          title={`${color.code} ${color.hex}`}
+                          onClick={() =>
+                            applyColorChange(
+                              color
+                            )
+                          }
+                          style={{
+                            width: "40px",
+                            height: "40px",
+                            padding: 0,
+                            display: "flex",
+                            alignItems:
+                              "center",
+                            justifyContent:
+                              "center",
+                            borderRadius: "6px",
+                            border:
+                              "1px solid rgba(58, 44, 48, 0.15)",
+                            backgroundColor:
+                              color.hex,
+                            color: textColor,
+                            fontFamily:
+                              "var(--font-mono)",
+                            fontSize: "9px",
+                            fontWeight: 700,
+                            lineHeight: 1,
+                            cursor: "pointer",
+                          }}
+                        >
+                          {color.code}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )
+            )}
+          </div>
+        </div>
       )}
     </section>
   );
