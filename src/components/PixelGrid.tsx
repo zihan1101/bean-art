@@ -70,13 +70,7 @@ function hexToRgb(hex: string) {
 
 /*
  * 手动区域平均缩放，替代 canvas 内置的双三次插值缩放。
- * 双三次插值在剧烈缩小、且原图有锐利边缘时容易产生
- * “振铃”伪影（边缘附近出现原图没有的过冲颜色，
- * 有时反而会让细节看起来“更清楚”，但那其实是伪影）。
- * 区域平均永远不会过冲，是缩小图片时避免这类伪影的标准做法，
- * 代价是小于一个目标像素的细节确实会被平均掉——
- * 这一步造成的细节损失是物理上不可避免的，
- * 只能通过增大 outputSize（提高图纸分辨率）来缓解。
+ * 避免剧烈缩小时产生振铃伪影。
  */
 function downsampleByAreaAverage(
   sourceData: Uint8ClampedArray,
@@ -141,11 +135,7 @@ function downsampleByAreaAverage(
 }
 
 /*
- * 双边滤波：只对“颜色相近”的邻居做平均，
- * 颜色差异大的邻居权重会被压得很低。
- *
- * spatialSigma：考虑多远的邻居，越大波及范围越广。
- * colorSigma：颜色容忍度，越大去噪越彻底但细节损失越多。
+ * 双边滤波：只对“颜色相近”的邻居做平均，保留真实边缘细节。
  */
 function bilateralFilter(
   pixels: RawPixel[],
@@ -159,10 +149,7 @@ function bilateralFilter(
     Math.ceil(spatialSigma * 2)
   );
 
-  const safeColorSigma = Math.max(
-    1,
-    colorSigma
-  );
+  const safeColorSigma = Math.max(1, colorSigma);
 
   const result: RawPixel[] = [];
 
@@ -235,7 +222,7 @@ function bilateralFilter(
 
 /*
  * 传统方式：用图片四角的平均颜色估计背景，
- * 再从边缘开始 flood fill，只删除与边缘连接的背景。
+ * 再从边缘开始 flood fill。
  */
 function computeCornerBackgroundMask(
   rawPixels: RawPixel[],
@@ -350,19 +337,12 @@ function PixelGrid({
   const [removalMode, setRemovalMode] =
     useState<BackgroundRemovalMode>("ai");
 
-  /*
-   * 双边滤波开关和参数。
-   * 默认值比之前更保守，避免默认情况下就吃掉细节。
-   */
   const [enableDenoise, setEnableDenoise] =
     useState(true);
   const [spatialSigma, setSpatialSigma] =
     useState(1.0);
   const [colorSigma, setColorSigma] = useState(12);
 
-  /*
-   * 颜色量化开关和参数。
-   */
   const [
     enableQuantization,
     setEnableQuantization,
@@ -383,11 +363,6 @@ function PixelGrid({
       let cleanUrl: string | null = null;
 
       try {
-        /*
-         * 根据选择的模式，决定图片来源：
-         * - "ai"：先用 AI 模型抠图，拿到带透明通道的图片
-         * - "corner" / "none"：直接用原图
-         */
         let sourceUrl = imageUrl as string;
 
         if (removalMode === "ai") {
@@ -412,11 +387,6 @@ function PixelGrid({
           return;
         }
 
-        /*
-         * 第一步：把原图缩放到一个适中的“工作分辨率”，
-         * 用浏览器内置的高质量缩放即可——
-         * 这一步还没到最终的极小尺寸，振铃伪影不明显。
-         */
         const workingSize = Math.min(
           Math.max(outputSize * 4, 200),
           1200
@@ -462,10 +432,6 @@ function PixelGrid({
             workingSize
           );
 
-        /*
-         * 第二步：手动区域平均缩放到最终的小尺寸，
-         * 避免双三次插值在剧烈缩小时产生振铃伪影。
-         */
         const areaAveragedPixels =
           downsampleByAreaAverage(
             workingImageData.data,
@@ -478,10 +444,6 @@ function PixelGrid({
           return;
         }
 
-        /*
-         * 第三步（可选）：双边滤波去噪，同时尽量保留真实边缘细节。
-         * 关闭时直接使用区域平均后的像素，不做任何额外平滑。
-         */
         const rawPixels = enableDenoise
           ? bilateralFilter(
               areaAveragedPixels,
@@ -492,11 +454,6 @@ function PixelGrid({
             )
           : areaAveragedPixels;
 
-        /*
-         * AI 模式：背景已经被抠除，透明区域 alpha 很低，不需要额外遮罩。
-         * corner 模式：用角落取色 + flood fill 计算背景遮罩。
-         * none 模式：完全不处理，只有原图本身透明的部分才会被当作空白。
-         */
         const backgroundMask =
           removalMode === "corner"
             ? computeCornerBackgroundMask(
@@ -505,12 +462,6 @@ function PixelGrid({
               )
             : null;
 
-        /*
-         * 第四步（可选）：在 Lab 色彩空间里做颜色量化，
-         * 把大量相近颜色合并成有限个代表色，再统一匹配 MARD 色号。
-         * 关闭时，每个像素独立去匹配最近的 MARD 色号，
-         * 能保留更多细节，但也会保留更多噪声色。
-         */
         let quantizedColorByPixelIndex: Map<
           number,
           { r: number; g: number; b: number }
@@ -598,9 +549,6 @@ function PixelGrid({
           }
         );
 
-        /*
-         * 3×3 众数滤波，清理剩余的孤立噪点像素。
-         */
         const filteredPatternPixels =
           applyModeFilter(patternPixels, {
             width: outputSize,
@@ -608,9 +556,6 @@ function PixelGrid({
             minimumMajorityCount: 5,
           });
 
-        /*
-         * 创建完整豆板。
-         */
         const boardPixels: PixelCell[] =
           Array.from(
             {
@@ -620,9 +565,6 @@ function PixelGrid({
             createEmptyPixel
           );
 
-        /*
-         * 把图案放到豆板中央。
-         */
         const startRow = Math.floor(
           (boardSize - outputSize) / 2
         );
@@ -693,9 +635,6 @@ function PixelGrid({
     maxColors,
   ]);
 
-  /*
-   * 统计每个 MARD 色号的数量。
-   */
   const colorStatistics =
     useMemo<ColorStatistic[]>(() => {
       const statisticMap =
@@ -757,9 +696,6 @@ function PixelGrid({
     );
   }, [colorStatistics]);
 
-  /*
-   * 导出高清 PNG。
-   */
   function exportPatternAsPng() {
     if (pixels.length === 0) {
       return;
@@ -819,9 +755,6 @@ function PixelGrid({
         return;
       }
 
-      /*
-       * 白色背景。
-       */
       context.fillStyle = "#FFFFFF";
       context.fillRect(
         0,
@@ -830,9 +763,6 @@ function PixelGrid({
         canvasHeight
       );
 
-      /*
-       * 标题。
-       */
       context.fillStyle = "#111111";
       context.textAlign = "center";
       context.textBaseline = "middle";
@@ -864,9 +794,6 @@ function PixelGrid({
       const boardY =
         outerPadding + titleHeight;
 
-      /*
-       * 绘制每个格子的颜色和色号。
-       */
       for (
         let row = 0;
         row < boardSize;
@@ -931,9 +858,6 @@ function PixelGrid({
         }
       }
 
-      /*
-       * 先画所有普通 1px 网格线。
-       */
       context.strokeStyle = "#B8BDC4";
       context.lineWidth = 1;
 
@@ -967,9 +891,6 @@ function PixelGrid({
         context.stroke();
       }
 
-      /*
-       * 每 5 格画 2px 分隔线。
-       */
       context.strokeStyle = "#8B929B";
       context.lineWidth = 2;
 
@@ -1007,9 +928,6 @@ function PixelGrid({
         context.stroke();
       }
 
-      /*
-       * 每 10 格画 3px 分隔线。
-       */
       context.strokeStyle = "#50565E";
       context.lineWidth = 3;
 
@@ -1043,9 +961,6 @@ function PixelGrid({
         context.stroke();
       }
 
-      /*
-       * 豆板最外圈 3px。
-       */
       context.strokeStyle = "#30343A";
       context.lineWidth = 3;
 
@@ -1056,9 +971,6 @@ function PixelGrid({
         boardPixelSize
       );
 
-      /*
-       * 图纸统计。
-       */
       const summaryY =
         boardY +
         boardPixelSize +
@@ -1094,9 +1006,6 @@ function PixelGrid({
         summaryY + 36
       );
 
-      /*
-       * 色号图例。
-       */
       const legendStartY =
         boardY +
         boardPixelSize +
@@ -1201,9 +1110,6 @@ function PixelGrid({
         }
       );
 
-      /*
-       * 下载 PNG。
-       */
       exportCanvas.toBlob(
         (blob) => {
           if (!blob) {
@@ -1241,100 +1147,86 @@ function PixelGrid({
     return null;
   }
 
-  /*
-   * 网页预览仍使用原来的大小。
-   * 即使页面显示不完整，也不影响高清导出。
-   */
   const cellSize = 24;
 
   return (
-    <section>
-      <h2>拼豆图纸预览</h2>
+    <section
+      style={{
+        background: "var(--paper)",
+        borderRadius: "18px",
+        padding: "24px",
+        border: "1px solid var(--border-soft)",
+      }}
+    >
+      <h2 style={{ fontSize: "18px", marginBottom: "16px" }}>
+        拼豆图纸预览
+      </h2>
 
+      {/* 去背景方式 */}
       <div
         style={{
-          marginBottom: "16px",
+          marginBottom: "14px",
           display: "flex",
           alignItems: "center",
-          gap: "20px",
+          gap: "10px",
           flexWrap: "wrap",
         }}
       >
-        <span style={{ fontWeight: 600 }}>
-          去背景方式：
+        <span
+          style={{
+            fontSize: "13px",
+            fontWeight: 600,
+            color: "var(--ink-soft)",
+          }}
+        >
+          去背景方式
         </span>
 
-        <label
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: "6px",
-            cursor: "pointer",
-          }}
-        >
-          <input
-            type="radio"
-            name="removal-mode"
-            value="ai"
-            checked={removalMode === "ai"}
-            onChange={() =>
-              setRemovalMode("ai")
+        {(
+          [
+            { value: "ai", label: "AI 智能识别" },
+            { value: "corner", label: "角落取色" },
+            { value: "none", label: "不处理" },
+          ] as const
+        ).map((option) => (
+          <button
+            key={option.value}
+            type="button"
+            onClick={() =>
+              setRemovalMode(option.value)
             }
-          />
-          AI 智能识别主体（推荐）
-        </label>
-
-        <label
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: "6px",
-            cursor: "pointer",
-          }}
-        >
-          <input
-            type="radio"
-            name="removal-mode"
-            value="corner"
-            checked={
-              removalMode === "corner"
-            }
-            onChange={() =>
-              setRemovalMode("corner")
-            }
-          />
-          传统方式（角落取色，速度快）
-        </label>
-
-        <label
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: "6px",
-            cursor: "pointer",
-          }}
-        >
-          <input
-            type="radio"
-            name="removal-mode"
-            value="none"
-            checked={
-              removalMode === "none"
-            }
-            onChange={() =>
-              setRemovalMode("none")
-            }
-          />
-          不消除背景（保留原图）
-        </label>
+            style={{
+              padding: "6px 16px",
+              borderRadius: "999px",
+              border:
+                removalMode === option.value
+                  ? "1px solid var(--bead-rose)"
+                  : "1px solid var(--border-soft)",
+              background:
+                removalMode === option.value
+                  ? "var(--bead-rose)"
+                  : "#FFFFFF",
+              color:
+                removalMode === option.value
+                  ? "#FFFFFF"
+                  : "var(--ink-soft)",
+              fontSize: "13px",
+              fontWeight: 600,
+              cursor: "pointer",
+            }}
+          >
+            {option.label}
+          </button>
+        ))}
       </div>
 
+      {/* 双边滤波去噪 */}
       <div
         style={{
-          marginBottom: "16px",
-          padding: "12px 16px",
-          border: "1px solid #d1d5db",
-          borderRadius: "8px",
+          marginBottom: "12px",
+          padding: "14px 16px",
+          background: "var(--pegboard)",
+          borderRadius: "14px",
         }}
       >
         <label
@@ -1344,7 +1236,10 @@ function PixelGrid({
             gap: "8px",
             cursor: "pointer",
             fontWeight: 600,
-            marginBottom: "8px",
+            fontSize: "13px",
+            color: "var(--ink)",
+            marginBottom:
+              enableDenoise ? "10px" : 0,
           }}
         >
           <input
@@ -1355,8 +1250,9 @@ function PixelGrid({
                 event.target.checked
               )
             }
+            style={{ accentColor: "var(--bead-rose)" }}
           />
-          启用双边滤波去噪
+          去噪（双边滤波）
         </label>
 
         {enableDenoise && (
@@ -1367,6 +1263,8 @@ function PixelGrid({
               gap: "20px",
               flexWrap: "wrap",
               paddingLeft: "24px",
+              fontSize: "13px",
+              color: "var(--ink-soft)",
             }}
           >
             <div
@@ -1391,7 +1289,10 @@ function PixelGrid({
                     Number(event.target.value)
                   )
                 }
-                style={{ width: "160px" }}
+                style={{
+                  width: "150px",
+                  accentColor: "var(--bead-rose)",
+                }}
               />
             </div>
 
@@ -1417,19 +1318,23 @@ function PixelGrid({
                     Number(event.target.value)
                   )
                 }
-                style={{ width: "160px" }}
+                style={{
+                  width: "150px",
+                  accentColor: "var(--bead-rose)",
+                }}
               />
             </div>
           </div>
         )}
       </div>
 
+      {/* 颜色量化 */}
       <div
         style={{
           marginBottom: "20px",
-          padding: "12px 16px",
-          border: "1px solid #d1d5db",
-          borderRadius: "8px",
+          padding: "14px 16px",
+          background: "var(--pegboard)",
+          borderRadius: "14px",
         }}
       >
         <label
@@ -1439,7 +1344,11 @@ function PixelGrid({
             gap: "8px",
             cursor: "pointer",
             fontWeight: 600,
-            marginBottom: "8px",
+            fontSize: "13px",
+            color: "var(--ink)",
+            marginBottom: enableQuantization
+              ? "10px"
+              : 0,
           }}
         >
           <input
@@ -1450,8 +1359,9 @@ function PixelGrid({
                 event.target.checked
               )
             }
+            style={{ accentColor: "var(--bead-rose)" }}
           />
-          启用颜色量化（合并相近色）
+          颜色量化（合并相近色）
         </label>
 
         {enableQuantization && (
@@ -1461,6 +1371,8 @@ function PixelGrid({
               alignItems: "center",
               gap: "8px",
               paddingLeft: "24px",
+              fontSize: "13px",
+              color: "var(--ink-soft)",
             }}
           >
             <label htmlFor="max-colors">
@@ -1478,14 +1390,25 @@ function PixelGrid({
                   Number(event.target.value)
                 )
               }
-              style={{ width: "220px" }}
+              style={{
+                width: "200px",
+                accentColor: "var(--bead-rose)",
+              }}
             />
           </div>
         )}
       </div>
 
       {isProcessing ? (
-        <p>正在处理图片，请稍候...</p>
+        <p
+          style={{
+            textAlign: "center",
+            color: "var(--ink-soft)",
+            padding: "24px 0",
+          }}
+        >
+          正在处理图片，请稍候...
+        </p>
       ) : (
         <>
           <button
@@ -1497,13 +1420,14 @@ function PixelGrid({
             }
             style={{
               marginBottom: "20px",
-              padding: "12px 20px",
-              border: "1px solid #222222",
-              borderRadius: "8px",
-              backgroundColor:
-                "#222222",
+              padding: "12px 24px",
+              border: "none",
+              borderRadius: "999px",
+              background: "var(--bead-rose)",
               color: "#FFFFFF",
-              fontSize: "16px",
+              fontFamily: "var(--font-display)",
+              fontWeight: 600,
+              fontSize: "15px",
               cursor:
                 pixels.length === 0
                   ? "not-allowed"
@@ -1512,6 +1436,10 @@ function PixelGrid({
                 pixels.length === 0
                   ? 0.5
                   : 1,
+              boxShadow:
+                pixels.length === 0
+                  ? "none"
+                  : "0 3px 0 rgba(58, 44, 48, 0.15)",
             }}
           >
             {isExporting
@@ -1533,16 +1461,14 @@ function PixelGrid({
                 gridTemplateRows: `repeat(${boardSize}, ${cellSize}px)`,
                 width: "fit-content",
                 margin: "0 auto",
-                backgroundColor:
-                  "#FFFFFF",
+                backgroundColor: "#FFFFFF",
               }}
             >
               {pixels.map(
                 (pixel, index) => {
-                  const row =
-                    Math.floor(
-                      index / boardSize
-                    );
+                  const row = Math.floor(
+                    index / boardSize
+                  );
 
                   const col =
                     index % boardSize;
@@ -1628,8 +1554,7 @@ function PixelGrid({
                         boxSizing:
                           "border-box",
                         display: "flex",
-                        alignItems:
-                          "center",
+                        alignItems: "center",
                         justifyContent:
                           "center",
 
@@ -1648,13 +1573,13 @@ function PixelGrid({
                             ? "transparent"
                             : textColor,
 
+                        fontFamily:
+                          "var(--font-mono)",
                         fontSize: "8px",
                         fontWeight: 600,
                         lineHeight: 1,
-                        overflow:
-                          "hidden",
-                        userSelect:
-                          "none",
+                        overflow: "hidden",
+                        userSelect: "none",
                       }}
                     >
                       {pixel.colorCode}
@@ -1668,26 +1593,27 @@ function PixelGrid({
           {pixels.length > 0 && (
             <div
               style={{
-                maxWidth: "900px",
-                margin: "32px auto 0",
+                marginTop: "28px",
               }}
             >
-              <h2>颜色用量</h2>
+              <h2 style={{ fontSize: "18px" }}>
+                颜色用量
+              </h2>
 
-              <p>
+              <p
+                style={{
+                  marginTop: "8px",
+                  fontSize: "14px",
+                  color: "var(--ink-soft)",
+                }}
+              >
                 总拼豆数量：
-                <strong>
+                <strong style={{ color: "var(--ink)" }}>
                   {totalBeads}
                 </strong>{" "}
-                颗
-              </p>
-
-              <p>
-                使用颜色数量：
-                <strong>
-                  {
-                    colorStatistics.length
-                  }
+                颗 · 使用颜色数量：
+                <strong style={{ color: "var(--ink)" }}>
+                  {colorStatistics.length}
                 </strong>{" "}
                 种
               </p>
@@ -1697,16 +1623,14 @@ function PixelGrid({
                   display: "grid",
                   gridTemplateColumns:
                     "repeat(auto-fit, minmax(150px, 1fr))",
-                  gap: "12px",
+                  gap: "10px",
                   marginTop: "16px",
                 }}
               >
                 {colorStatistics.map(
                   (color) => {
                     const rgb =
-                      hexToRgb(
-                        color.hex
-                      );
+                      hexToRgb(color.hex);
 
                     const textColor =
                       getTextColor(
@@ -1717,48 +1641,37 @@ function PixelGrid({
 
                     return (
                       <div
-                        key={
-                          color.code
-                        }
+                        key={color.code}
                         style={{
-                          display:
-                            "flex",
+                          display: "flex",
                           alignItems:
                             "center",
-                          gap: "12px",
-                          padding:
-                            "10px",
+                          gap: "10px",
+                          padding: "8px 10px",
                           border:
-                            "1px solid #d1d5db",
-                          borderRadius:
-                            "8px",
-                          backgroundColor:
-                            "#FFFFFF",
+                            "1px solid var(--border-soft)",
+                          borderRadius: "999px",
+                          background:
+                            "var(--paper)",
                         }}
                       >
                         <div
                           style={{
-                            width:
-                              "42px",
-                            height:
-                              "42px",
+                            width: "34px",
+                            height: "34px",
                             flexShrink: 0,
-                            display:
-                              "flex",
+                            display: "flex",
                             alignItems:
                               "center",
                             justifyContent:
                               "center",
-                            border:
-                              "1px solid #9ca3af",
-                            borderRadius:
-                              "6px",
+                            borderRadius: "50%",
                             backgroundColor:
                               color.hex,
-                            color:
-                              textColor,
-                            fontSize:
-                              "11px",
+                            color: textColor,
+                            fontFamily:
+                              "var(--font-mono)",
+                            fontSize: "9px",
                             fontWeight: 700,
                           }}
                         >
@@ -1768,24 +1681,23 @@ function PixelGrid({
                         <div>
                           <div
                             style={{
+                              fontFamily:
+                                "var(--font-mono)",
                               fontWeight: 700,
+                              fontSize: "13px",
                             }}
                           >
-                            {
-                              color.code
-                            }
+                            {color.code}
                           </div>
 
                           <div
                             style={{
-                              fontSize:
-                                "14px",
+                              fontSize: "12px",
+                              color:
+                                "var(--ink-soft)",
                             }}
                           >
-                            {
-                              color.count
-                            }{" "}
-                            颗
+                            {color.count} 颗
                           </div>
                         </div>
                       </div>
