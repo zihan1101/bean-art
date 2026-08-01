@@ -4,7 +4,9 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "predev": "bash scripts/fetch-bg-removal-assets.sh",
     "dev": "vite",
+    "prebuild": "bash scripts/fetch-bg-removal-assets.sh",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview"
